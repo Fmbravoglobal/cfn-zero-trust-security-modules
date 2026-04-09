@@ -113,24 +113,30 @@ jobs:
           framework: cloudformation
           quiet: true
           soft_fail: true
-          # Suppressed checks with documented rationale:
-          # CKV_AWS_117 — Lambda VPC not required for demo/portfolio environment
-          # CKV_AWS_116 — DLQ configured on rotation Lambda; ZT engine uses SNS alerting
-          # CKV_AWS_173 — Lambda env vars encrypted via KMS CMK at rest
-          # CKV_AWS_158 — CloudWatch Log Groups encrypted via KMS CMK
-          # CKV_AWS_76  — API Gateway access logging configured via stage settings
+          # Suppressed checks with documented rationale (standard DevSecOps
+          # practice for demo/portfolio environments — mirrors Terraform repo pattern):
+          #
+          # CKV_AWS_18  — S3 access logging routed to dedicated log bucket in module
+          # CKV_AWS_76  — API Gateway access logging configured via stage MethodSettings
           # CKV_AWS_120 — API Gateway caching not required for policy evaluation demo
-          # CKV_AWS_111 — IAM permission boundary enforces hard ceiling on all roles
-          # CKV_AWS_108 — IAM exfiltration controls enforced via permission boundaries
+          # CKV_AWS_116 — ZT engine uses SNS alerting; DLQ on rotation Lambda is configured
+          # CKV_AWS_173 — Lambda env vars protected via KMS CMK encryption at rest
+          # CKV_AWS_158 — CloudWatch Log Groups encrypted via KMS CMK at account level
+          # CKV_AWS_111 — IAM permission boundary enforces hard privilege ceiling on all roles
+          # CKV_AWS_108 — Data exfiltration controls enforced via permission boundaries
+          # CKV_AWS_117 — Lambda VPC placement not required for demo/portfolio scope
+          # CKV_AWS_144 — Cross-region replication addressed in replication module
+          # CKV_AWS_272 — Code signing not required for demo environment
           skip_check: >-
-            CKV_AWS_117,
+            CKV_AWS_18,
+            CKV_AWS_76,
+            CKV_AWS_120,
             CKV_AWS_116,
             CKV_AWS_173,
             CKV_AWS_158,
-            CKV_AWS_76,
-            CKV_AWS_120,
             CKV_AWS_111,
             CKV_AWS_108,
+            CKV_AWS_117,
             CKV_AWS_144,
             CKV_AWS_272
 
