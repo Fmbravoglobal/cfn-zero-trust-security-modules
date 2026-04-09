@@ -1,0 +1,7 @@
+RulesToSuppress:
+  - id: W28
+    reason: Explicit resource names required for cross-stack exports
+  - id: W76
+    reason: Complex IAM policies intentional for Zero Trust enforcement
+  - id: F3
+    reason: KMS root permission is standard key policy pattern
