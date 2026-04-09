@@ -1,0 +1,429 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Secure S3 Module — Reusable hardened S3 bucket with KMS CMK encryption,
+  public access blocking, versioning, access logging, lifecycle management,
+  SNS event notifications, and cross-region replication.
+  Compliance: CIS AWS v1.5 (2.1.1-2.1.5), NIST 800-53 (SC-28, SC-12, AU-2, AU-9),
+  SOC 2 Type II (CC6.1, CC6.6, CC6.7, A1.2), PCI-DSS v3.2 (Req 3.4, 3.5, 7.1, 10.2, 10.5)
+  Author: Oluwafemi Alabi Okunlola | github.com/Fmbravoglobal
+
+# -------------------------------------------------------------------
+# Parameters
+# -------------------------------------------------------------------
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Project name prefix for all resources
+    Default: fmbravoglobal-secure-s3
+
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: dev
+    Description: Deployment environment
+
+  AlertEmail:
+    Type: String
+    Description: Email address for SNS security alert notifications
+    Default: security-alerts@example.com
+
+  EnableReplication:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: Enable cross-region replication to ReplicaRegion
+
+  ReplicaRegion:
+    Type: String
+    Default: us-west-2
+    Description: Destination region for cross-region replication (used only if EnableReplication=true)
+
+  KMSKeyDeletionWindow:
+    Type: Number
+    Default: 30
+    MinValue: 7
+    MaxValue: 30
+    Description: KMS key pending deletion window in days
+
+  NoncurrentVersionExpiryDays:
+    Type: Number
+    Default: 90
+    Description: Days before noncurrent S3 object versions expire
+
+# -------------------------------------------------------------------
+# Conditions
+# -------------------------------------------------------------------
+Conditions:
+  ReplicationEnabled: !Equals [!Ref EnableReplication, "true"]
+  IsProd: !Equals [!Ref Environment, "prod"]
+
+# -------------------------------------------------------------------
+# Resources
+# -------------------------------------------------------------------
+Resources:
+
+  # ── KMS Customer-Managed Key ──────────────────────────────────────
+  S3KMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "CMK for ${ProjectName} S3 encryption — ${Environment}"
+      EnableKeyRotation: true               # CIS 2.8 / NIST SC-12
+      PendingWindowInDays: !Ref KMSKeyDeletionWindow
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableRootPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowS3ServiceUse
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: "*"
+          - Sid: AllowSNSServiceUse
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: "*"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: CloudFormation
+        - Key: ComplianceScope
+          Value: "CIS,NIST800-53,SOC2,PCI-DSS"
+
+  S3KMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}-s3-key-${Environment}"
+      TargetKeyId: !Ref S3KMSKey
+
+  # ── SNS Topic for S3 Event Notifications ─────────────────────────
+  S3EventSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-s3-events-${Environment}"
+      KmsMasterKeyId: !Ref S3KMSKey       # Encryption at rest — NIST SC-28
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  S3EventSNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref S3EventSNSTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowS3Publish
+            Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref S3EventSNSTopic
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:s3:::${ProjectName}-${Environment}-*"
+
+  # ── Access Log Bucket ─────────────────────────────────────────────
+  AccessLogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ProjectName}-access-logs-${Environment}-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref S3KMSKey
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:       # CIS 2.1.5
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldLogs
+            Status: Enabled
+            ExpirationInDays: 365
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: AccessLogs
+        - Key: Environment
+          Value: !Ref Environment
+
+  AccessLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyNonTLS
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt AccessLogBucket.Arn
+              - !Sub "${AccessLogBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"    # NIST SC-8 / PCI-DSS Req 4
+          - Sid: AllowS3LogDelivery
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${AccessLogBucket.Arn}/s3-access-logs/*"
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:s3:::${ProjectName}-primary-${Environment}-${AWS::AccountId}"
+
+  # ── Primary Secure Bucket ─────────────────────────────────────────
+  SecurePrimaryBucket:
+    Type: AWS::S3::Bucket
+    DependsOn:
+      - AccessLogBucket
+      - S3EventSNSTopicPolicy
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ProjectName}-primary-${Environment}-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms             # CIS 2.1.1 / NIST SC-28
+              KMSMasterKeyID: !Ref S3KMSKey
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:           # CIS 2.1.5
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:                  # CIS 2.1.3
+        Status: Enabled
+      LoggingConfiguration:                     # CIS 2.1.4 / NIST AU-2
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: s3-access-logs/
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupIncompleteMultipart
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: ExpireNoncurrentVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref NoncurrentVersionExpiryDays
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Topic: !Ref S3EventSNSTopic
+            Event: "s3:ObjectCreated:*"
+          - Topic: !Ref S3EventSNSTopic
+            Event: "s3:ObjectRemoved:*"
+      ReplicationConfiguration: !If
+        - ReplicationEnabled
+        - Role: !GetAtt ReplicationRole.Arn
+          Rules:
+            - Id: ReplicateAll
+              Status: Enabled
+              Destination:
+                Bucket: !Sub "arn:aws:s3:::${ProjectName}-replica-${Environment}-${AWS::AccountId}"
+                StorageClass: STANDARD
+                EncryptionConfiguration:
+                  ReplicaKmsKeyID: !Sub "arn:aws:kms:${ReplicaRegion}:${AWS::AccountId}:alias/${ProjectName}-replica-key-${Environment}"
+              Filter:
+                Prefix: ""
+              DeleteMarkerReplication:
+                Status: Enabled
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: DataClassification
+          Value: Confidential
+        - Key: ComplianceScope
+          Value: "CIS,NIST800-53,SOC2,PCI-DSS"
+
+  SecurePrimaryBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SecurePrimaryBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyNonTLS
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt SecurePrimaryBucket.Arn
+              - !Sub "${SecurePrimaryBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"    # PCI-DSS Req 4 / NIST SC-8
+          - Sid: DenyUnencryptedObjectUploads
+            Effect: Deny
+            Principal: "*"
+            Action: s3:PutObject
+            Resource: !Sub "${SecurePrimaryBucket.Arn}/*"
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption: aws:kms
+
+  # ── IAM Read-Only Role (Least Privilege) ──────────────────────────
+  S3ReadOnlyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-s3-readonly-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3ReadOnlyPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowListBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt SecurePrimaryBucket.Arn
+              - Sid: AllowGetObjects
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${SecurePrimaryBucket.Arn}/*"
+              - Sid: AllowKMSDecrypt
+                Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt S3KMSKey.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: LeastPrivilege
+          Value: "true"
+
+  # ── Replication Role (conditional) ───────────────────────────────
+  ReplicationRole:
+    Type: AWS::IAM::Role
+    Condition: ReplicationEnabled
+    Properties:
+      RoleName: !Sub "${ProjectName}-s3-replication-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ReplicationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetReplicationConfiguration
+                  - s3:ListBucket
+                Resource: !GetAtt SecurePrimaryBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObjectVersionForReplication
+                  - s3:GetObjectVersionAcl
+                  - s3:GetObjectVersionTagging
+                Resource: !Sub "${SecurePrimaryBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - s3:ReplicateObject
+                  - s3:ReplicateDelete
+                  - s3:ReplicateTags
+                Resource: !Sub "arn:aws:s3:::${ProjectName}-replica-${Environment}-${AWS::AccountId}/*"
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !GetAtt S3KMSKey.Arn
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                Resource: !Sub "arn:aws:kms:${ReplicaRegion}:${AWS::AccountId}:alias/${ProjectName}-replica-key-${Environment}"
+
+# -------------------------------------------------------------------
+# Outputs
+# -------------------------------------------------------------------
+Outputs:
+  PrimaryBucketName:
+    Description: Name of the hardened primary S3 bucket
+    Value: !Ref SecurePrimaryBucket
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-primary-bucket"
+
+  PrimaryBucketArn:
+    Description: ARN of the hardened primary S3 bucket
+    Value: !GetAtt SecurePrimaryBucket.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-primary-bucket-arn"
+
+  AccessLogBucketName:
+    Description: Name of the access log bucket
+    Value: !Ref AccessLogBucket
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-log-bucket"
+
+  KMSKeyId:
+    Description: KMS CMK Key ID
+    Value: !Ref S3KMSKey
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-kms-key-id"
+
+  KMSKeyArn:
+    Description: KMS CMK Key ARN
+    Value: !GetAtt S3KMSKey.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-kms-key-arn"
+
+  SNSTopicArn:
+    Description: ARN of the S3 event notification SNS topic
+    Value: !Ref S3EventSNSTopic
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-sns-topic-arn"
+
+  S3ReadOnlyRoleArn:
+    Description: ARN of the least-privilege S3 read-only IAM role
+    Value: !GetAtt S3ReadOnlyRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-readonly-role-arn"

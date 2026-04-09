@@ -1,0 +1,410 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Zero Trust Policy Engine Module — Risk-adaptive access control with
+  DynamoDB decision store, SNS alerting, Lambda policy evaluator,
+  and continuous trust verification. AWS layer of the multi-cloud
+  Zero Trust framework.
+  Compliance: NIST 800-53 (AC-2, AC-3, AC-6, AC-17, IA-2, IA-5, SI-4),
+  NIST SP 800-207 (Zero Trust Architecture), CIS AWS v1.5
+  Author: Oluwafemi Alabi Okunlola | github.com/Fmbravoglobal
+
+# -------------------------------------------------------------------
+# Parameters
+# -------------------------------------------------------------------
+Parameters:
+  ProjectName:
+    Type: String
+    Default: fmbravoglobal-zero-trust-engine
+
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: dev
+
+  AlertEmail:
+    Type: String
+    Default: security-alerts@example.com
+
+  PolicyEvaluationMode:
+    Type: String
+    AllowedValues: [ENFORCE, AUDIT]
+    Default: AUDIT
+    Description: >
+      ENFORCE — deny access on policy violation.
+      AUDIT — log violations without blocking (recommended for initial rollout).
+
+  RiskScoreThresholdHigh:
+    Type: Number
+    Default: 70
+    Description: Risk score >= this value triggers ESCALATE/DENY decision
+
+  RiskScoreThresholdMedium:
+    Type: Number
+    Default: 40
+    Description: Risk score >= this value triggers INVESTIGATE decision
+
+  LambdaS3Bucket:
+    Type: String
+    Default: my-lambda-deployments
+
+  LambdaS3Key:
+    Type: String
+    Default: policy_engine_lambda.zip
+
+# -------------------------------------------------------------------
+# Resources
+# -------------------------------------------------------------------
+Resources:
+
+  # ── KMS Key ───────────────────────────────────────────────────────
+  PolicyEngineKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "CMK for ${ProjectName} Zero Trust policy engine — ${Environment}"
+      EnableKeyRotation: true
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableRootPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowLambdaUse
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt PolicyEvaluatorRole.Arn
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: "*"
+          - Sid: AllowDynamoDB
+            Effect: Allow
+            Principal:
+              Service: dynamodb.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: "*"
+          - Sid: AllowSNS
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: "*"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  PolicyEngineKMSAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}-zt-engine-${Environment}"
+      TargetKeyId: !Ref PolicyEngineKMSKey
+
+  # ── SNS Policy Alerts Topic ───────────────────────────────────────
+  PolicyAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-policy-alerts-${Environment}"
+      KmsMasterKeyId: !Ref PolicyEngineKMSKey
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── DynamoDB — Policy Decision Store ─────────────────────────────
+  PolicyDecisionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-policy-decisions-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref PolicyEngineKMSKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: request_id
+          AttributeType: S
+        - AttributeName: evaluated_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: request_id
+          KeyType: HASH
+        - AttributeName: evaluated_at
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: EvaluatedAtIndex
+          KeySchema:
+            - AttributeName: evaluated_at
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: PolicyDecisionStore
+
+  # ── DynamoDB — Identity Context Store ────────────────────────────
+  IdentityContextTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-identity-context-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref PolicyEngineKMSKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: identity_id
+          AttributeType: S
+        - AttributeName: last_seen
+          AttributeType: S
+      KeySchema:
+        - AttributeName: identity_id
+          KeyType: HASH
+        - AttributeName: last_seen
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: IdentityContextStore
+
+  # ── Lambda Policy Evaluator Role ──────────────────────────────────
+  PolicyEvaluatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-policy-evaluator-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PolicyEvaluatorPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: AllowDynamoDBWrite
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt PolicyDecisionsTable.Arn
+                  - !GetAtt IdentityContextTable.Arn
+                  - !Sub "${PolicyDecisionsTable.Arn}/index/*"
+              - Sid: AllowSNSPublish
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref PolicyAlertsTopic
+              - Sid: AllowLogging
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}*"
+              - Sid: AllowXRay
+                Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: "*"
+              - Sid: DenyIAMWrite
+                Effect: Deny
+                Action:
+                  - iam:Create*
+                  - iam:Delete*
+                  - iam:Attach*
+                  - iam:Put*
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: LeastPrivilege
+          Value: "true"
+
+  # ── Lambda Policy Evaluator Function ──────────────────────────────
+  PolicyEvaluatorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-policy-evaluator-${Environment}"
+      RetentionInDays: 90
+
+  PolicyEvaluatorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: PolicyEvaluatorLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-policy-evaluator-${Environment}"
+      Description: >
+        Zero Trust policy evaluator — risk-adaptive access decisions based on
+        identity context, device posture, behavioral signals, and geo-risk.
+      Runtime: python3.11
+      Handler: app.main.lambda_handler
+      Role: !GetAtt PolicyEvaluatorRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Ref LambdaS3Key
+      Timeout: 30
+      MemorySize: 512
+      ReservedConcurrentExecutions: 20
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          DECISIONS_TABLE: !Ref PolicyDecisionsTable
+          IDENTITY_TABLE: !Ref IdentityContextTable
+          SNS_TOPIC_ARN: !Ref PolicyAlertsTopic
+          EVALUATION_MODE: !Ref PolicyEvaluationMode
+          HIGH_RISK_THRESHOLD: !Sub "${RiskScoreThresholdHigh}"
+          MEDIUM_RISK_THRESHOLD: !Sub "${RiskScoreThresholdMedium}"
+          ENVIRONMENT: !Ref Environment
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        ZeroTrustComponent: PolicyEvaluator
+
+  # ── API Gateway — Policy Evaluation Endpoint ─────────────────────
+  PolicyEvaluationAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${ProjectName}-api-${Environment}"
+      Description: Zero Trust policy evaluation API
+      EndpointConfiguration:
+        Types: [REGIONAL]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  PolicyEvaluationResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref PolicyEvaluationAPI
+      ParentId: !GetAtt PolicyEvaluationAPI.RootResourceId
+      PathPart: evaluate
+
+  PolicyEvaluationMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref PolicyEvaluationAPI
+      ResourceId: !Ref PolicyEvaluationResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PolicyEvaluatorFunction.Arn}/invocations"
+
+  APIGatewayLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PolicyEvaluatorFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${PolicyEvaluationAPI}/*/*/evaluate"
+
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: PolicyEvaluationMethod
+    Properties:
+      RestApiId: !Ref PolicyEvaluationAPI
+      Description: !Sub "Deployment for ${Environment}"
+
+  APIStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref PolicyEvaluationAPI
+      DeploymentId: !Ref APIDeployment
+      StageName: !Ref Environment
+      TracingEnabled: true
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          LoggingLevel: INFO
+          DataTraceEnabled: false
+          MetricsEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── EventBridge — Continuous Trust Verification ───────────────────
+  TrustVerificationSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-trust-verification-${Environment}"
+      Description: Periodic continuous trust verification across active sessions
+      ScheduleExpression: rate(15 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt PolicyEvaluatorFunction.Arn
+          Id: PeriodicTrustVerification
+          Input: !Sub '{"action": "VERIFY_ACTIVE_SESSIONS", "environment": "${Environment}"}'
+
+  TrustVerificationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PolicyEvaluatorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt TrustVerificationSchedule.Arn
+
+# -------------------------------------------------------------------
+# Outputs
+# -------------------------------------------------------------------
+Outputs:
+  PolicyEvaluatorLambdaArn:
+    Description: Zero Trust policy evaluator Lambda ARN
+    Value: !GetAtt PolicyEvaluatorFunction.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-policy-evaluator-arn"
+
+  PolicyDecisionsTableName:
+    Description: DynamoDB policy decisions table
+    Value: !Ref PolicyDecisionsTable
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-decisions-table"
+
+  PolicyEvaluationAPIEndpoint:
+    Description: Policy evaluation API endpoint
+    Value: !Sub "https://${PolicyEvaluationAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/evaluate"
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-api-endpoint"
+
+  KMSKeyArn:
+    Description: Zero Trust engine KMS key ARN
+    Value: !GetAtt PolicyEngineKMSKey.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-zt-kms-arn"
+
+  PolicyAlertTopicArn:
+    Description: Policy alerts SNS topic ARN
+    Value: !Ref PolicyAlertsTopic
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-policy-alerts-arn"

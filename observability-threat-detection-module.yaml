@@ -1,0 +1,537 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Centralized Observability & Threat Detection Module — GuardDuty, Security Hub,
+  CloudTrail, Config, CloudWatch alarms, and EventBridge-to-Lambda automated
+  response pipeline. Zero Trust continuous monitoring layer.
+  Compliance: NIST 800-53 (AU-2, AU-6, AU-9, IR-4, SI-4), CIS AWS v1.5 (2.x, 3.x),
+  SOC 2 (CC7.2, CC7.3), PCI-DSS Req 10
+  Author: Oluwafemi Alabi Okunlola | github.com/Fmbravoglobal
+
+# -------------------------------------------------------------------
+# Parameters
+# -------------------------------------------------------------------
+Parameters:
+  ProjectName:
+    Type: String
+    Default: fmbravoglobal-observability
+
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: dev
+
+  AlertEmail:
+    Type: String
+    Default: security-alerts@example.com
+
+  GuardDutyFindingSeverityThreshold:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 10
+    Description: >
+      Minimum GuardDuty finding severity to trigger automated response.
+      1-3=Low, 4-6=Medium, 7-10=High
+
+  CloudTrailLogRetentionDays:
+    Type: Number
+    Default: 365
+    Description: CloudTrail log retention in days — NIST AU-11 / PCI-DSS Req 10.7
+
+  EnableConfigRecorder:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Enable AWS Config continuous configuration recording
+
+  LambdaS3Bucket:
+    Type: String
+    Default: my-lambda-deployments
+
+  LambdaS3Key:
+    Type: String
+    Default: threat_processor_lambda.zip
+
+# -------------------------------------------------------------------
+# Conditions
+# -------------------------------------------------------------------
+Conditions:
+  ConfigEnabled: !Equals [!Ref EnableConfigRecorder, "true"]
+  IsProd: !Equals [!Ref Environment, "prod"]
+
+# -------------------------------------------------------------------
+# Resources
+# -------------------------------------------------------------------
+Resources:
+
+  # ── KMS Key for Observability Resources ───────────────────────────
+  ObservabilityKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "CMK for ${ProjectName} observability resources — ${Environment}"
+      EnableKeyRotation: true
+      PendingWindowInDays: 30
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableRootPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowCloudTrail
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action:
+              - kms:GenerateDataKey*
+              - kms:Decrypt
+            Resource: "*"
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+          - Sid: AllowSNS
+            Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: "*"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  ObservabilityKMSAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${ProjectName}-observability-${Environment}"
+      TargetKeyId: !Ref ObservabilityKMSKey
+
+  # ── SNS Alert Topic ───────────────────────────────────────────────
+  SecurityAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${ProjectName}-security-alerts-${Environment}"
+      KmsMasterKeyId: !Ref ObservabilityKMSKey
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── CloudTrail — All-Region Management + Data Events ─────────────
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "${ProjectName}-cloudtrail-${Environment}-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref ObservabilityKMSKey
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: RetainLogs
+            Status: Enabled
+            ExpirationInDays: !Ref CloudTrailLogRetentionDays
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Purpose
+          Value: CloudTrailLogs
+
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyNonTLS
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt CloudTrailBucket.Arn
+              - !Sub "${CloudTrailBucket.Arn}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+          - Sid: AllowCloudTrailAclCheck
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt CloudTrailBucket.Arn
+            Condition:
+              StringEquals:
+                aws:SourceArn: !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${ProjectName}-trail-${Environment}"
+          - Sid: AllowCloudTrailWrite
+            Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${CloudTrailBucket.Arn}/AWSLogs/${AWS::AccountId}/*"
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  CloudTrailLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/cloudtrail/${ProjectName}-${Environment}"
+      RetentionInDays: 90
+      KmsKeyId: !GetAtt ObservabilityKMSKey.Arn
+
+  CloudTrailLogGroupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-cloudtrail-cw-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudTrailCWPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt CloudTrailLogGroup.Arn
+
+  MultiRegionTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn: CloudTrailBucketPolicy
+    Properties:
+      TrailName: !Sub "${ProjectName}-trail-${Environment}"
+      S3BucketName: !Ref CloudTrailBucket
+      IsLogging: true
+      IsMultiRegionTrail: true              # CIS 2.1 — all-region trail
+      IncludeGlobalServiceEvents: true      # CIS 2.4 — global service events
+      EnableLogFileValidation: true         # CIS 2.2 — log file integrity
+      KMSKeyId: !Ref ObservabilityKMSKey   # CIS 2.7 — encrypted trail
+      CloudWatchLogsLogGroupArn: !GetAtt CloudTrailLogGroup.Arn
+      CloudWatchLogsRoleArn: !GetAtt CloudTrailLogGroupRole.Arn
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: AWS::S3::Object
+              Values: ["arn:aws:s3:::"]    # All S3 objects — PCI-DSS Req 10
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── GuardDuty ─────────────────────────────────────────────────────
+  GuardDutyDetector:
+    Type: AWS::GuardDuty::Detector
+    Properties:
+      Enable: true
+      FindingPublishingFrequency: FIFTEEN_MINUTES
+      DataSources:
+        S3Logs:
+          Enable: true
+        Kubernetes:
+          AuditLogs:
+            Enable: true
+        MalwareProtection:
+          ScanEc2InstanceWithFindings:
+            EbsVolumes: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── DynamoDB for Findings Storage ─────────────────────────────────
+  FindingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${ProjectName}-findings-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      TableClass: STANDARD
+      SSESpecification:
+        SSEEnabled: true                    # NIST SC-28
+        SSEType: KMS
+        KMSMasterKeyId: !Ref ObservabilityKMSKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: finding_id
+          AttributeType: S
+        - AttributeName: event_time
+          AttributeType: S
+      KeySchema:
+        - AttributeName: finding_id
+          KeyType: HASH
+        - AttributeName: event_time
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── Lambda Threat Processor Role ──────────────────────────────────
+  ThreatProcessorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-threat-processor-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ThreatProcessorPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt FindingsTable.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref SecurityAlertTopic
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt ObservabilityKMSKey.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}*"
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - guardduty:GetFindings
+                  - guardduty:ListFindings
+                Resource: !Sub "arn:aws:guardduty:${AWS::Region}:${AWS::AccountId}:detector/${GuardDutyDetector}"
+
+  # ── Lambda Threat Processor ───────────────────────────────────────
+  ThreatProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-threat-processor-${Environment}"
+      RetentionInDays: 90
+
+  ThreatProcessorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ThreatProcessorLogGroup
+    Properties:
+      FunctionName: !Sub "${ProjectName}-threat-processor-${Environment}"
+      Description: Processes GuardDuty findings, scores severity, stores to DynamoDB, alerts via SNS
+      Runtime: python3.11
+      Handler: app.main.lambda_handler
+      Role: !GetAtt ThreatProcessorRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Ref LambdaS3Key
+      Timeout: 30
+      MemorySize: 256
+      ReservedConcurrentExecutions: 10
+      TracingConfig:
+        Mode: Active
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref FindingsTable
+          SNS_TOPIC_ARN: !Ref SecurityAlertTopic
+          SEVERITY_THRESHOLD: !Sub "${GuardDutyFindingSeverityThreshold}"
+          ENVIRONMENT: !Ref Environment
+          DETECTOR_ID: !Ref GuardDutyDetector
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # ── EventBridge Rule — GuardDuty Findings ─────────────────────────
+  GuardDutyFindingsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${ProjectName}-guardduty-findings-${Environment}"
+      Description: Route GuardDuty findings to threat processor Lambda
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.guardduty
+        detail-type:
+          - GuardDuty Finding
+        detail:
+          severity:
+            - numeric:
+              - ">="
+              - !Ref GuardDutyFindingSeverityThreshold
+      Targets:
+        - Arn: !GetAtt ThreatProcessorFunction.Arn
+          Id: ThreatProcessorTarget
+
+  EventBridgeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ThreatProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt GuardDutyFindingsRule.Arn
+
+  # ── AWS Config Recorder ───────────────────────────────────────────
+  ConfigRecorderRole:
+    Type: AWS::IAM::Role
+    Condition: ConfigEnabled
+    Properties:
+      RoleName: !Sub "${ProjectName}-config-recorder-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWS_ConfigRole
+
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Condition: ConfigEnabled
+    Properties:
+      Name: !Sub "${ProjectName}-config-recorder-${Environment}"
+      RoleARN: !GetAtt ConfigRecorderRole.Arn
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Condition: ConfigEnabled
+    DependsOn: CloudTrailBucketPolicy
+    Properties:
+      Name: !Sub "${ProjectName}-config-delivery-${Environment}"
+      S3BucketName: !Ref CloudTrailBucket
+      S3KeyPrefix: config
+      SnsTopicARN: !Ref SecurityAlertTopic
+
+  # ── CloudWatch Alarms for Critical Events ─────────────────────────
+  UnauthorizedAPICallsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-unauthorized-api-calls-${Environment}"
+      AlarmDescription: Unauthorized API calls detected — possible credential compromise
+      MetricName: UnauthorizedAPICalls
+      Namespace: !Sub "${ProjectName}/SecurityMetrics"
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref SecurityAlertTopic
+      TreatMissingData: notBreaching
+
+  ConsoleLoginWithoutMFAAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-console-no-mfa-${Environment}"
+      AlarmDescription: Console login without MFA — CIS AWS 3.2
+      MetricName: ConsoleLoginWithoutMFA
+      Namespace: !Sub "${ProjectName}/SecurityMetrics"
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref SecurityAlertTopic
+      TreatMissingData: notBreaching
+
+  IAMPolicyChangeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-iam-policy-change-${Environment}"
+      AlarmDescription: IAM policy changed — CIS AWS 3.4 drift detection
+      MetricName: IAMPolicyChanges
+      Namespace: !Sub "${ProjectName}/SecurityMetrics"
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref SecurityAlertTopic
+      TreatMissingData: notBreaching
+
+# -------------------------------------------------------------------
+# Outputs
+# -------------------------------------------------------------------
+Outputs:
+  GuardDutyDetectorId:
+    Description: GuardDuty Detector ID
+    Value: !Ref GuardDutyDetector
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-guardduty-detector-id"
+
+  ThreatProcessorLambdaArn:
+    Description: Threat processor Lambda ARN
+    Value: !GetAtt ThreatProcessorFunction.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-threat-processor-arn"
+
+  FindingsTableName:
+    Description: DynamoDB findings table name
+    Value: !Ref FindingsTable
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-findings-table"
+
+  CloudTrailArn:
+    Description: CloudTrail ARN
+    Value: !GetAtt MultiRegionTrail.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-cloudtrail-arn"
+
+  SecurityAlertTopicArn:
+    Description: Security alert SNS topic ARN
+    Value: !Ref SecurityAlertTopic
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-security-alert-topic-arn"

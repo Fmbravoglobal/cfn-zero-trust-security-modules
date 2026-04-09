@@ -1,0 +1,390 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  IAM Least-Privilege Governance Module — Policy-as-Code IAM enforcement
+  with role segmentation, OIDC federation for CI/CD, permission boundary
+  enforcement, and automated drift prevention.
+  Compliance: CIS AWS v1.5 (1.x IAM), NIST 800-53 (AC-2, AC-3, AC-6, IA-2, IA-5),
+  SOC 2 (CC6.1, CC6.3), PCI-DSS (Req 7.1, 8.x)
+  Author: Oluwafemi Alabi Okunlola | github.com/Fmbravoglobal
+
+# -------------------------------------------------------------------
+# Parameters
+# -------------------------------------------------------------------
+Parameters:
+  ProjectName:
+    Type: String
+    Default: fmbravoglobal-iam-governance
+    Description: Project name prefix
+
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: dev
+
+  GitHubOrg:
+    Type: String
+    Default: Fmbravoglobal
+    Description: GitHub organization name for OIDC federation
+
+  GitHubRepo:
+    Type: String
+    Default: "*"
+    Description: GitHub repository name for OIDC trust (use * to allow all repos in org)
+
+  EnablePermissionBoundary:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Enforce permission boundary on all created roles
+
+  MaxSessionDurationSeconds:
+    Type: Number
+    Default: 3600
+    MinValue: 900
+    MaxValue: 43200
+    Description: Maximum session duration for assumed roles (seconds)
+
+# -------------------------------------------------------------------
+# Conditions
+# -------------------------------------------------------------------
+Conditions:
+  BoundaryEnabled: !Equals [!Ref EnablePermissionBoundary, "true"]
+  IsProd: !Equals [!Ref Environment, "prod"]
+
+# -------------------------------------------------------------------
+# Resources
+# -------------------------------------------------------------------
+Resources:
+
+  # ── Permission Boundary Policy ────────────────────────────────────
+  # Enforces a hard ceiling on what any role in this stack can do.
+  # Roles cannot exceed these permissions regardless of their own policies.
+  PermissionBoundaryPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${ProjectName}-permission-boundary-${Environment}"
+      Description: >
+        Permission boundary enforcing least-privilege ceiling.
+        No role using this boundary can exceed these permissions.
+        NIST AC-6 / CIS IAM controls.
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCoreServiceAccess
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:ListBucket
+              - s3:DeleteObject
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - secretsmanager:GetSecretValue
+              - secretsmanager:DescribeSecret
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - cloudwatch:PutMetricData
+              - xray:PutTraceSegments
+              - xray:PutTelemetryRecords
+              - sns:Publish
+              - sqs:SendMessage
+              - sqs:ReceiveMessage
+              - sqs:DeleteMessage
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:Query
+              - dynamodb:Scan
+              - dynamodb:UpdateItem
+            Resource: "*"
+          - Sid: DenyPrivilegeEscalation
+            Effect: Deny
+            Action:
+              - iam:CreateUser
+              - iam:DeleteUser
+              - iam:AttachUserPolicy
+              - iam:AttachRolePolicy
+              - iam:CreateAccessKey
+              - iam:CreateLoginProfile
+              - iam:UpdateLoginProfile
+              - iam:PutUserPolicy
+              - iam:PutRolePolicy
+              - sts:AssumeRole
+            Resource: "*"
+            Condition:
+              StringNotEquals:
+                aws:ResourceTag/ManagedBy: CloudFormation
+          - Sid: DenyOrganizationLeave
+            Effect: Deny
+            Action:
+              - organizations:LeaveOrganization
+            Resource: "*"
+
+  # ── GitHub Actions OIDC Provider ──────────────────────────────────
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+
+  # ── GitHub Actions CI/CD Role (OIDC — no long-lived credentials) ──
+  GitHubActionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-github-actions-${Environment}"
+      Description: >
+        OIDC-federated role for GitHub Actions — eliminates long-lived
+        static credentials. NIST IA-5 / CIS 1.19.
+      MaxSessionDuration: !Ref MaxSessionDurationSeconds
+      PermissionsBoundary: !If
+        - BoundaryEnabled
+        - !Ref PermissionBoundaryPolicy
+        - !Ref AWS::NoValue
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: GitHubOIDCTrust
+            Effect: Allow
+            Principal:
+              Federated: !Ref GitHubOIDCProvider
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub "repo:${GitHubOrg}/${GitHubRepo}:*"
+      ManagedPolicyArns:
+        - !Ref CICDDeployPolicy
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: AuthMethod
+          Value: OIDC-Federation
+        - Key: NoLongLivedCredentials
+          Value: "true"
+
+  # ── CI/CD Deploy Policy (least-privilege for pipeline operations) ─
+  CICDDeployPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${ProjectName}-cicd-deploy-${Environment}"
+      Description: Least-privilege policy for CI/CD pipeline deployment operations
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowTerraformStateS3
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:ListBucket
+            Resource:
+              - !Sub "arn:aws:s3:::${ProjectName}-tfstate-${Environment}-${AWS::AccountId}"
+              - !Sub "arn:aws:s3:::${ProjectName}-tfstate-${Environment}-${AWS::AccountId}/*"
+          - Sid: AllowTerraformStateLock
+            Effect: Allow
+            Action:
+              - dynamodb:GetItem
+              - dynamodb:PutItem
+              - dynamodb:DeleteItem
+            Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-tflock-${Environment}"
+          - Sid: AllowSecurityScanArtifacts
+            Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+            Resource: !Sub "arn:aws:s3:::${ProjectName}-scan-results-${Environment}-${AWS::AccountId}/*"
+          - Sid: AllowCloudFormationDeploy
+            Effect: Allow
+            Action:
+              - cloudformation:CreateStack
+              - cloudformation:UpdateStack
+              - cloudformation:DescribeStacks
+              - cloudformation:DescribeStackEvents
+              - cloudformation:ValidateTemplate
+              - cloudformation:GetTemplate
+            Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${ProjectName}-*"
+          - Sid: AllowLogging
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogGroups
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/cicd/${ProjectName}*"
+
+  # ── Application Workload Role (EC2/Lambda) ────────────────────────
+  AppWorkloadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-app-workload-${Environment}"
+      Description: Least-privilege application workload role — no admin, no wildcard resources
+      MaxSessionDuration: !Ref MaxSessionDurationSeconds
+      PermissionsBoundary: !If
+        - BoundaryEnabled
+        - !Ref PermissionBoundaryPolicy
+        - !Ref AWS::NoValue
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref AppWorkloadPolicy
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: LeastPrivilege
+          Value: "true"
+
+  AppWorkloadPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${ProjectName}-app-workload-policy-${Environment}"
+      Description: Scoped policy for application workloads — no admin, no wildcard resources
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowSecretsRead
+            Effect: Allow
+            Action:
+              - secretsmanager:GetSecretValue
+              - secretsmanager:DescribeSecret
+            Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${ProjectName}/*"
+          - Sid: AllowKMSUse
+            Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: !Sub "arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/${ProjectName}-*"
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/app/${ProjectName}*"
+          - Sid: AllowXRayTracing
+            Effect: Allow
+            Action:
+              - xray:PutTraceSegments
+              - xray:PutTelemetryRecords
+            Resource: "*"
+          - Sid: DenyIAMWrite
+            Effect: Deny
+            Action:
+              - iam:Create*
+              - iam:Delete*
+              - iam:Attach*
+              - iam:Detach*
+              - iam:Put*
+              - iam:Update*
+            Resource: "*"
+
+  # ── Security Auditor Role (read-only) ─────────────────────────────
+  SecurityAuditorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-security-auditor-${Environment}"
+      Description: Read-only security auditor role for compliance verification — NIST AU-6
+      MaxSessionDuration: !Ref MaxSessionDurationSeconds
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/SecurityAudit    # AWS managed read-only security audit
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: SecurityAudit
+
+  # ── IAM Access Analyzer ───────────────────────────────────────────
+  IAMAccessAnalyzer:
+    Type: AWS::AccessAnalyzer::Analyzer
+    Properties:
+      AnalyzerName: !Sub "${ProjectName}-analyzer-${Environment}"
+      Type: ACCOUNT
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── CloudWatch Alarm — Root Account Usage ─────────────────────────
+  RootAccountUsageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${ProjectName}-root-account-usage-${Environment}"
+      AlarmDescription: >
+        CRITICAL: Root account login detected. CIS AWS 1.1 — Root account
+        should not be used for daily operations.
+      MetricName: RootAccountUsageCount
+      Namespace: !Sub "${ProjectName}/IAMGovernance"
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+# -------------------------------------------------------------------
+# Outputs
+# -------------------------------------------------------------------
+Outputs:
+  GitHubActionsRoleArn:
+    Description: OIDC-federated GitHub Actions role ARN (no long-lived credentials)
+    Value: !GetAtt GitHubActionsRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-github-actions-role-arn"
+
+  AppWorkloadRoleArn:
+    Description: Least-privilege application workload role ARN
+    Value: !GetAtt AppWorkloadRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-app-role-arn"
+
+  SecurityAuditorRoleArn:
+    Description: Read-only security auditor role ARN
+    Value: !GetAtt SecurityAuditorRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-auditor-role-arn"
+
+  PermissionBoundaryArn:
+    Description: Permission boundary policy ARN — attach to all new roles
+    Value: !Ref PermissionBoundaryPolicy
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-permission-boundary-arn"
+
+  OIDCProviderArn:
+    Description: GitHub OIDC provider ARN
+    Value: !Ref GitHubOIDCProvider
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-oidc-provider-arn"
+
+  AccessAnalyzerArn:
+    Description: IAM Access Analyzer ARN for external access detection
+    Value: !GetAtt IAMAccessAnalyzer.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-access-analyzer-arn"

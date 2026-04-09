@@ -1,0 +1,259 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Fmbravoglobal Zero Trust Cloud Security — Master Orchestration Stack.
+  Deploys all security modules as nested stacks: Secure S3, IAM Governance,
+  Secrets Rotation, Observability/Threat Detection, and Zero Trust Policy Engine.
+  This is the single-command deployment entrypoint for the full framework.
+  Author: Oluwafemi Alabi Okunlola | github.com/Fmbravoglobal
+
+# -------------------------------------------------------------------
+# Metadata — Console UI grouping
+# -------------------------------------------------------------------
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Project Identity"
+        Parameters: [ProjectName, Environment, AlertEmail]
+      - Label:
+          default: "Template Storage (S3 bucket containing nested stack templates)"
+        Parameters: [TemplatesBucket, TemplatesPrefix]
+      - Label:
+          default: "Lambda Deployment"
+        Parameters: [LambdaS3Bucket]
+      - Label:
+          default: "GitHub OIDC Federation"
+        Parameters: [GitHubOrg, GitHubRepo]
+      - Label:
+          default: "Zero Trust Policy Engine"
+        Parameters: [PolicyEvaluationMode, RiskScoreThresholdHigh]
+      - Label:
+          default: "Feature Flags"
+        Parameters: [DeploySecretsRotation, DeployZeroTrustEngine, EnableReplication]
+    ParameterLabels:
+      ProjectName:
+        default: "Project Name Prefix"
+      PolicyEvaluationMode:
+        default: "ZT Policy Mode (AUDIT recommended for first deploy)"
+
+# -------------------------------------------------------------------
+# Parameters
+# -------------------------------------------------------------------
+Parameters:
+  ProjectName:
+    Type: String
+    Default: fmbravoglobal-zt-security
+    Description: Prefix applied to all resource names
+
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, prod]
+    Default: dev
+
+  AlertEmail:
+    Type: String
+    Default: security-alerts@example.com
+    Description: Email for all security and operational alerts
+
+  TemplatesBucket:
+    Type: String
+    Description: S3 bucket where nested stack YAML templates are stored
+
+  TemplatesPrefix:
+    Type: String
+    Default: cfn-templates
+    Description: S3 prefix (folder) for nested stack templates
+
+  LambdaS3Bucket:
+    Type: String
+    Default: my-lambda-deployments
+    Description: S3 bucket containing Lambda deployment packages
+
+  GitHubOrg:
+    Type: String
+    Default: Fmbravoglobal
+    Description: GitHub org for OIDC federation
+
+  GitHubRepo:
+    Type: String
+    Default: "*"
+    Description: GitHub repo for OIDC trust scope
+
+  PolicyEvaluationMode:
+    Type: String
+    AllowedValues: [ENFORCE, AUDIT]
+    Default: AUDIT
+
+  RiskScoreThresholdHigh:
+    Type: Number
+    Default: 70
+
+  DeploySecretsRotation:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Deploy the Secrets Rotation module
+
+  DeployZeroTrustEngine:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Deploy the Zero Trust Policy Engine module
+
+  EnableReplication:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: Enable S3 cross-region replication
+
+# -------------------------------------------------------------------
+# Conditions
+# -------------------------------------------------------------------
+Conditions:
+  DeployRotation: !Equals [!Ref DeploySecretsRotation, "true"]
+  DeployZT: !Equals [!Ref DeployZeroTrustEngine, "true"]
+
+# -------------------------------------------------------------------
+# Nested Stacks
+# -------------------------------------------------------------------
+Resources:
+
+  # ── 1. Secure S3 Module ───────────────────────────────────────────
+  SecureS3Stack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${TemplatesBucket}.s3.${AWS::Region}.amazonaws.com/${TemplatesPrefix}/secure-s3-kms-module.yaml"
+      TimeoutInMinutes: 30
+      Parameters:
+        ProjectName: !Sub "${ProjectName}-s3"
+        Environment: !Ref Environment
+        AlertEmail: !Ref AlertEmail
+        EnableReplication: !Ref EnableReplication
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Module
+          Value: SecureS3
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── 2. IAM Governance Module ──────────────────────────────────────
+  IAMGovernanceStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${TemplatesBucket}.s3.${AWS::Region}.amazonaws.com/${TemplatesPrefix}/iam-least-privilege-module.yaml"
+      TimeoutInMinutes: 20
+      Parameters:
+        ProjectName: !Sub "${ProjectName}-iam"
+        Environment: !Ref Environment
+        GitHubOrg: !Ref GitHubOrg
+        GitHubRepo: !Ref GitHubRepo
+        EnablePermissionBoundary: "true"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Module
+          Value: IAMGovernance
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── 3. Observability & Threat Detection Module ────────────────────
+  ObservabilityStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub "https://${TemplatesBucket}.s3.${AWS::Region}.amazonaws.com/${TemplatesPrefix}/observability-threat-detection-module.yaml"
+      TimeoutInMinutes: 30
+      Parameters:
+        ProjectName: !Sub "${ProjectName}-obs"
+        Environment: !Ref Environment
+        AlertEmail: !Ref AlertEmail
+        LambdaS3Bucket: !Ref LambdaS3Bucket
+        LambdaS3Key: threat_processor_lambda.zip
+        EnableConfigRecorder: "true"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Module
+          Value: ObservabilityThreatDetection
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── 4. Secrets Rotation Module (conditional) ──────────────────────
+  SecretsRotationStack:
+    Type: AWS::CloudFormation::Stack
+    Condition: DeployRotation
+    Properties:
+      TemplateURL: !Sub "https://${TemplatesBucket}.s3.${AWS::Region}.amazonaws.com/${TemplatesPrefix}/secrets-rotation-module.yaml"
+      TimeoutInMinutes: 20
+      Parameters:
+        ProjectName: !Sub "${ProjectName}-secrets"
+        Environment: !Ref Environment
+        AlertEmail: !Ref AlertEmail
+        LambdaS3Bucket: !Ref LambdaS3Bucket
+        LambdaS3Key: rotation_lambda.zip
+        RotationIntervalDays: "30"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Module
+          Value: SecretsRotation
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── 5. Zero Trust Policy Engine (conditional) ─────────────────────
+  ZeroTrustEngineStack:
+    Type: AWS::CloudFormation::Stack
+    Condition: DeployZT
+    Properties:
+      TemplateURL: !Sub "https://${TemplatesBucket}.s3.${AWS::Region}.amazonaws.com/${TemplatesPrefix}/zero-trust-policy-engine-module.yaml"
+      TimeoutInMinutes: 30
+      Parameters:
+        ProjectName: !Sub "${ProjectName}-zt"
+        Environment: !Ref Environment
+        AlertEmail: !Ref AlertEmail
+        PolicyEvaluationMode: !Ref PolicyEvaluationMode
+        RiskScoreThresholdHigh: !Ref RiskScoreThresholdHigh
+        LambdaS3Bucket: !Ref LambdaS3Bucket
+        LambdaS3Key: policy_engine_lambda.zip
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Module
+          Value: ZeroTrustEngine
+        - Key: Environment
+          Value: !Ref Environment
+
+# -------------------------------------------------------------------
+# Outputs — Cross-stack references for integration
+# -------------------------------------------------------------------
+Outputs:
+  SecureS3BucketName:
+    Description: Primary secure S3 bucket name
+    Value: !GetAtt SecureS3Stack.Outputs.PrimaryBucketName
+
+  IAMGitHubActionsRoleArn:
+    Description: GitHub Actions OIDC role ARN
+    Value: !GetAtt IAMGovernanceStack.Outputs.GitHubActionsRoleArn
+
+  GuardDutyDetectorId:
+    Description: GuardDuty detector ID
+    Value: !GetAtt ObservabilityStack.Outputs.GuardDutyDetectorId
+
+  CloudTrailArn:
+    Description: CloudTrail ARN
+    Value: !GetAtt ObservabilityStack.Outputs.CloudTrailArn
+
+  SecretsRotationLambdaArn:
+    Condition: DeployRotation
+    Description: Secrets rotation Lambda ARN
+    Value: !GetAtt SecretsRotationStack.Outputs.RotationLambdaArn
+
+  ZeroTrustPolicyAPIEndpoint:
+    Condition: DeployZT
+    Description: Zero Trust policy evaluation API endpoint
+    Value: !GetAtt ZeroTrustEngineStack.Outputs.PolicyEvaluationAPIEndpoint
+
+  ZeroTrustPolicyEvaluatorArn:
+    Condition: DeployZT
+    Description: Zero Trust policy evaluator Lambda ARN
+    Value: !GetAtt ZeroTrustEngineStack.Outputs.PolicyEvaluatorLambdaArn
