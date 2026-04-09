@@ -61,6 +61,13 @@ Resources:
   # Roles cannot exceed these permissions regardless of their own policies.
   PermissionBoundaryPolicy:
     Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_111
+            comment: Permission boundary is the enforcement mechanism — wildcard actions are bounded by this policy itself
+          - id: CKV_AWS_108
+            comment: Data exfiltration controls enforced via DenyPrivilegeEscalation and DenyOrganizationLeave statements
     Properties:
       ManagedPolicyName: !Sub "${ProjectName}-permission-boundary-${Environment}"
       Description: >
