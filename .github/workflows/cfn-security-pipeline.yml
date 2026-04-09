@@ -1,0 +1,170 @@
+name: CloudFormation Security Validation Pipeline
+
+# Mirrors the Terraform multi-scanner pipeline structure applied to CloudFormation.
+# Runs cfn-lint (linting), cfn-nag (security scanning), and Checkov (policy-as-code)
+# on every push and pull request — blocking merges on any critical finding.
+# Author: Oluwafemi Alabi Okunlola | github.com/Fmbravoglobal
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**.yaml"
+      - "**.yml"
+      - ".github/workflows/cfn-security-pipeline.yml"
+  pull_request:
+    paths:
+      - "**.yaml"
+      - "**.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write   # For SARIF upload to GitHub Security tab
+
+env:
+  TEMPLATES_DIR: "."
+  CFN_LINT_VERSION: "0.87.3"
+  PYTHON_VERSION: "3.11"
+
+jobs:
+
+  # ── Job 1: CloudFormation Lint (cfn-lint) ─────────────────────────
+  cfn-lint:
+    name: cfn-lint — CloudFormation Linting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install cfn-lint
+        run: pip install cfn-lint==${{ env.CFN_LINT_VERSION }}
+
+      - name: Run cfn-lint on all templates
+        run: |
+          echo "=== CloudFormation Lint Scan ==="
+          echo "Scanning all YAML templates in repository..."
+          cfn-lint ${{ env.TEMPLATES_DIR }}/modules/*.yaml \
+                   ${{ env.TEMPLATES_DIR }}/master-stack.yaml \
+                   --format json \
+                   --output-file cfn-lint-results.json || true
+
+          cfn-lint ${{ env.TEMPLATES_DIR }}/modules/*.yaml \
+                   ${{ env.TEMPLATES_DIR }}/master-stack.yaml \
+                   --format parseable
+
+          echo "=== cfn-lint scan complete ==="
+
+      - name: Upload cfn-lint results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cfn-lint-results
+          path: cfn-lint-results.json
+          retention-days: 30
+
+  # ── Job 2: cfn-nag Security Scan ─────────────────────────────────
+  cfn-nag:
+    name: cfn-nag — CloudFormation Security Scanning
+    runs-on: ubuntu-latest
+    needs: cfn-lint
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Ruby for cfn-nag
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2"
+
+      - name: Install cfn-nag
+        run: gem install cfn-nag
+
+      - name: Run cfn-nag on all modules
+        run: |
+          echo "=== cfn-nag Security Scan ==="
+          FAILED=0
+
+          for template in modules/*.yaml master-stack.yaml; do
+            echo ""
+            echo "--- Scanning: $template ---"
+            cfn_nag_scan --input-path "$template" \
+                         --deny-list-path .cfn-nag-deny-list.yml \
+                         --output-format json > "cfn-nag-$(basename $template .yaml).json" || FAILED=1
+            cfn_nag_scan --input-path "$template" || true
+          done
+
+          if [ $FAILED -ne 0 ]; then
+            echo ""
+            echo "PIPELINE BLOCKED: cfn-nag found security violations."
+            exit 1
+          fi
+          echo "=== cfn-nag scan passed — no blocking violations ==="
+
+      - name: Upload cfn-nag results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cfn-nag-results
+          path: cfn-nag-*.json
+          retention-days: 30
+
+  # ── Job 3: Checkov Policy-as-Code Scan ───────────────────────────
+  checkov:
+    name: checkov — Policy-as-Code Security Scan
+    runs-on: ubuntu-latest
+    needs: cfn-lint
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run Checkov on CloudFormation templates
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: .
+          framework: cloudformation
+          quiet: true
+          soft_fail: false
+          output_format: cli,sarif
+          output_file_path: console,checkov-results.sarif
+          skip_check: >-
+            CKV_AWS_144,
+            CKV_AWS_117,
+            CKV_AWS_272
+
+      - name: Upload Checkov SARIF to GitHub Security
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-results.sarif
+          category: checkov-cloudformation
+
+  # ── Job 4: Template Validation Summary ───────────────────────────
+  validation-summary:
+    name: Validation Summary
+    runs-on: ubuntu-latest
+    needs: [cfn-lint, cfn-nag, checkov]
+    if: always()
+    steps:
+      - name: Pipeline Summary
+        run: |
+          echo "================================================="
+          echo " CloudFormation Security Pipeline Summary"
+          echo "================================================="
+          echo " cfn-lint  : ${{ needs.cfn-lint.result }}"
+          echo " cfn-nag   : ${{ needs.cfn-nag.result }}"
+          echo " checkov   : ${{ needs.checkov.result }}"
+          echo "================================================="
+          if [[ "${{ needs.cfn-lint.result }}" == "failure" || \
+                "${{ needs.cfn-nag.result }}" == "failure" || \
+                "${{ needs.checkov.result }}" == "failure" ]]; then
+            echo " STATUS: PIPELINE FAILED — merge blocked"
+            exit 1
+          else
+            echo " STATUS: ALL CHECKS PASSED"
+          fi
